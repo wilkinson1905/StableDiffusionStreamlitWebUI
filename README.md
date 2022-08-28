@@ -1,5 +1,6 @@
 # StableDiffusionStreamlitWebUI
-Stable DiffusionのWebアプリをStreamlitを用いて作成しました
+Stable DiffusionのWebアプリをStreamlitを用いて作成しました  
+[![Twitter URL](https://img.shields.io/twitter/url/https/twitter.com/aiartcreator824.svg?style=social&label=Follow%20%40aiartcreator824)](https://twitter.com/aiartcreator824)
 
 # どんなことができるか
 1. Stable Diffusionのtxt2imgをWebブラウザ上で実行できます
@@ -8,7 +9,8 @@ Stable DiffusionのWebアプリをStreamlitを用いて作成しました
 4. 作成した画像のファイル名にシード値とプロンプトが記載してあるので、その値を入力するともう一度同じ画像を生成できます
 
 # ギャラリー
-あとで記載
+![Gallery1](assets/gallery1.png)  
+![Gallery2](assets/gallery2.png)
 
 # 環境構築
 1. 前提としてStable Diffusionをローカルにインストール済みであるとします
