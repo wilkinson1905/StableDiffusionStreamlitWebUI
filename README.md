@@ -14,7 +14,7 @@ Stable DiffusionのWebアプリをStreamlitを用いて作成しました
 
 # 環境構築
 1. 前提としてStable Diffusionをローカルにインストール済みであるとします
-2. Stable Diffusionのフォルダのscriptsフォルダにこのリポジトリのwebui.pyをコピーします
+2. Stable Diffusionのフォルダのscriptsフォルダにこのリポジトリのwebui.pyとtxt2img4webui.pyをコピーします
 3. Stable Diffusionの環境に追加のライブラリをインストールします( conda install streamlit==1.12.0 )
 
 # 実行方法
