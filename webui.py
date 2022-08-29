@@ -1,376 +1,19 @@
-import argparse, os, sys, glob, random
-import cv2
-import torch
-import numpy as np
-from omegaconf import OmegaConf
-from PIL import Image
-from tqdm import tqdm, trange
-from imwatermark import WatermarkEncoder
-from itertools import islice
-from einops import rearrange
-from torchvision.utils import make_grid
-import time
-from pytorch_lightning import seed_everything
-from torch import autocast
-from contextlib import contextmanager, nullcontext
+import random, time, os
 import streamlit as st
+import threading
+import subprocess
+import PIL
+from PIL import Image
 
-from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
-
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-from transformers import AutoFeatureExtractor
-
-
-# load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+def generate(prompt, seed,ddim_steps, prompt_correction, n_iter):
+    subprocess.run(f"python scripts/txt2img4webui.py --prompt '{prompt}' --seed {seed} --ddim_steps {ddim_steps} --n_iter {n_iter} --prompt_correction '{prompt_correction}'", capture_output=False, shell=True)
 
 
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
 
-
-def numpy_to_pil(images):
-    """
-    Convert a numpy image or a batch of images to a PIL image.
-    """
-    if images.ndim == 3:
-        images = images[None, ...]
-    images = (images * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-
-    return pil_images
-
-
-def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
-
-    model.cuda()
-    model.eval()
-    return model
-
-
-def put_watermark(img, wm_encoder=None):
-    if wm_encoder is not None:
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        img = wm_encoder.encode(img, 'dwtDct')
-        img = Image.fromarray(img[:, :, ::-1])
-    return img
-
-
-def load_replacement(x):
-    try:
-        hwc = x.shape
-        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
-        y = (np.array(y)/255.0).astype(x.dtype)
-        assert y.shape == x.shape
-        return y
-    except Exception:
-        return x
-
-
-def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
-
-
-def get_aug():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        nargs="?",
-        default="a painting of a virus monster playing guitar",
-        help="the prompt to render"
-    )
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        nargs="?",
-        help="dir to write results to",
-        default="outputs/txt2img-samples"
-    )
-    parser.add_argument(
-        "--skip_grid",
-        type=bool,
-        default=True,
-        help="do not save a grid, only individual samples. Helpful when evaluating lots of samples",
-    )
-    parser.add_argument(
-        "--skip_save",
-        action='store_true',
-        help="do not save individual samples. For speed measurements.",
-    )
-    parser.add_argument(
-        "--ddim_steps",
-        type=int,
-        default=50,
-        help="number of ddim sampling steps",
-    )
-    parser.add_argument(
-        "--plms",
-        type=bool,
-        default=True,
-        help="use plms sampling",
-    )
-    parser.add_argument(
-        "--laion400m",
-        action='store_true',
-        help="uses the LAION400M model",
-    )
-    parser.add_argument(
-        "--fixed_code",
-        action='store_true',
-        help="if enabled, uses the same starting code across samples ",
-    )
-    parser.add_argument(
-        "--ddim_eta",
-        type=float,
-        default=0.0,
-        help="ddim eta (eta=0.0 corresponds to deterministic sampling",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=2,
-        help="sample this often",
-    )
-    parser.add_argument(
-        "--H",
-        type=int,
-        default=512,
-        help="image height, in pixel space",
-    )
-    parser.add_argument(
-        "--W",
-        type=int,
-        default=512,
-        help="image width, in pixel space",
-    )
-    parser.add_argument(
-        "--C",
-        type=int,
-        default=4,
-        help="latent channels",
-    )
-    parser.add_argument(
-        "--f",
-        type=int,
-        default=8,
-        help="downsampling factor",
-    )
-    parser.add_argument(
-        "--n_samples",
-        type=int,
-        default=1,
-        help="how many samples to produce for each given prompt. A.k.a. batch size",
-    )
-    parser.add_argument(
-        "--n_rows",
-        type=int,
-        default=0,
-        help="rows in the grid (default: n_samples)",
-    )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=7.5,
-        help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
-    )
-    parser.add_argument(
-        "--from-file",
-        type=str,
-        help="if specified, load prompts from this file",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/stable-diffusion/v1-inference.yaml",
-        help="path to config which constructs model",
-    )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default="models/ldm/stable-diffusion-v1/model.ckpt",
-        help="path to checkpoint of model",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="the seed (for reproducible sampling)",
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        help="evaluate at this precision",
-        choices=["full", "autocast"],
-        default="autocast"
-    )
-    opt = parser.parse_args()
-    return opt
-
-class Txt2img:
-    def __init__(self, opt) -> None:
-        if opt.laion400m:
-            print("Falling back to LAION 400M model...")
-            opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
-            opt.ckpt = "models/ldm/text2img-large/model.ckpt"
-            opt.outdir = "outputs/txt2img-samples-laion400m"
-
-        seed_everything(opt.seed)
-
-        config = OmegaConf.load(f"{opt.config}")
-        model = load_model_from_config(config, f"{opt.ckpt}")
-
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        model = model.to(device)
-
-        if opt.plms:
-            sampler = PLMSSampler(model)
-        else:
-            sampler = DDIMSampler(model)
-
-        os.makedirs(opt.outdir, exist_ok=True)
-        outpath = opt.outdir
-
-        print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-        wm = "StableDiffusionV1"
-        wm_encoder = WatermarkEncoder()
-        wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
-
-        batch_size = opt.n_samples
-        n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-        if not opt.from_file:
-            prompt = opt.prompt
-            assert prompt is not None
-            data = [batch_size * [prompt]]
-
-        else:
-            print(f"reading prompts from {opt.from_file}")
-            with open(opt.from_file, "r") as f:
-                data = f.read().splitlines()
-                data = list(chunk(data, batch_size))
-
-        sample_path = os.path.join(outpath, "samples")
-        os.makedirs(sample_path, exist_ok=True)
-        base_count = len(os.listdir(sample_path))
-        grid_count = len(os.listdir(outpath)) - 1
-
-        start_code = None
-        if opt.fixed_code:
-            start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
-
-        precision_scope = autocast if opt.precision=="autocast" else nullcontext
-        self.opt = opt
-        self.model = model 
-        self.batch_size = batch_size
-        self.start_code = start_code
-        self.sample_path = sample_path
-        self.n_rows = n_rows
-        self.wm_encoder = wm_encoder
-        self.outpath = outpath
-        self.precision_scope = precision_scope
-        self.data = data 
-        self.sampler = sampler
-        self.base_count = base_count
-        self.grid_count = grid_count
-    def generate(self, prompt, seed, ddim_steps=50):
-        opt = self.opt
-        model = self.model
-        batch_size = self.batch_size
-        start_code = self.start_code
-        sample_path = self.sample_path
-        n_rows = self.n_rows
-        wm_encoder = self.wm_encoder
-        outpath = self.outpath
-        precision_scope = self.precision_scope
-        data = [batch_size * [prompt]]
-        sampler = self.sampler
-        with torch.no_grad():
-            with precision_scope("cuda"):
-                with model.ema_scope():
-                    tic = time.time()
-                    all_samples = list()
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=ddim_steps,
-                                                        conditioning=c,
-                                                        batch_size=opt.n_samples,
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=opt.scale,
-                                                        unconditional_conditioning=uc,
-                                                        eta=opt.ddim_eta,
-                                                        x_T=start_code)
-
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
-                        # x_checked_image = x_samples_ddim
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
-
-                        filename = f"{self.base_count:05}-{seed}-{prompt.replace(' ','_')}.png"
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, filename))
-                                self.base_count += 1
-
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
-
-                    if not opt.skip_grid:
-                        # additionally, save as grid
-                        grid = torch.stack(all_samples, 0)
-                        grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                        grid = make_grid(grid, nrow=n_rows)
-
-                        # to image
-                        grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                        img = Image.fromarray(grid.astype(np.uint8))
-                        img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(outpath, f'grid-{self.grid_count:04}.png'))
-                        self.grid_count += 1
-
-                    toc = time.time()
-        return img, filename
-
-def generator_tab(model):
+def generator_tab():
     prompt = st.text_input('Prompt')
     with st.expander("Advanced settings"):
+        prompt_correction = st.text_input('Prompt Correction(プロンプト1::重み1,プロンプト2::重み2,...)')
         n_iter = st.selectbox("n_iter", range(1,11), index=0)
         ddim_steps = st.selectbox("ddim_steps", [10,20,30,40,50], index=4)
         seed = st.number_input('seed number(-1 means random)',min_value=-1, value = -1, step=1)
@@ -378,42 +21,47 @@ def generator_tab(model):
         progressbar = st.progress(0.0)
         if seed == -1:
             seed = random.randint(0,9999999)
-        for i in range(n_iter):
-            progressbar.progress(i/float(n_iter))
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed(seed)
-            with st.spinner('Please wait...'):
-                image, filename = model.generate(prompt, seed,ddim_steps)
-            st.image(image, caption=filename)
-            seed += 1
+        t1 = threading.Thread(target=generate,args=(prompt, seed,ddim_steps, prompt_correction, n_iter))
+        t1.start()
+        base_count = len(os.listdir("outputs/txt2img-samples/samples/"))
+        last_count = base_count
+        now_count = base_count
+        while now_count - base_count < n_iter:
+            dir_list = sorted(os.listdir("outputs/txt2img-samples/samples/"))
+            now_count = len(dir_list)
+            if last_count != now_count:
+                try:
+                    st.image(os.path.join("outputs/txt2img-samples/samples/",dir_list[-1]),caption=dir_list[-1])
+                except PIL.UnidentifiedImageError:
+                    continue
+                progressbar.progress((now_count - base_count)/float(n_iter))
+                last_count = now_count
+            time.sleep(1)
+            if not t1.is_alive():
+                break
         progressbar.progress(1.0)
+        t1.join()
+
 def gallery_tab():
     #絶対パスを取得
     PROJECT_PATH = os.path.abspath(os.path.dirname(__file__))
     #画像保存フォルダのパスを取得
     image_dir = os.path.join(PROJECT_PATH,'../outputs/txt2img-samples/samples')
     # 画像ファイルのリストを取得
-    fName_list = sorted(os.listdir(image_dir))[::-1]
+    fName_list = sorted(os.listdir(image_dir))[::-1][:20]
     #画像ファイル数
-    img_file_num = len(os.listdir(image_dir))
+    img_file_num = len(fName_list)
     for idx in range(img_file_num):
         if idx % 4 == 0:
             cols = st.columns(4)
         cols[idx % 4].image(f'{os.path.join(image_dir, fName_list[idx])}',width=150, caption=fName_list[idx])
 
-@st.experimental_singleton
-def initializetion():
-    random.seed()
-    opt = get_aug()
-    model =  Txt2img(opt)
-    return model 
 
 if __name__ == "__main__":
-    model = initializetion()
     st.title('Stable Diffusion WebUI by aiartcreator')
     tab1, tab2 = st.tabs(["Generator","Gallery"])
     with tab1:
-        generator_tab(model)
+        generator_tab()
     with tab2:
         gallery_tab()
 
