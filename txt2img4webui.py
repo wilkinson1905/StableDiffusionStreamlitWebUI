@@ -280,7 +280,7 @@ class Txt2img:
                 data = f.read().splitlines()
                 data = list(chunk(data, batch_size))
 
-        sample_path = os.path.join(outpath, "samples")
+        sample_path = outpath
         os.makedirs(sample_path, exist_ok=True)
         base_count = len(os.listdir(sample_path))
         grid_count = len(os.listdir(outpath)) - 1
@@ -356,7 +356,7 @@ class Txt2img:
                             x_checked_image = x_samples_ddim
                             x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                            filename = f"{self.base_count:05}-{seed}-{prompt.replace(' ','_')}.png"
+                            filename = f"{self.base_count:05}-txt2img-{seed}-{prompt.replace(' ','_')}.png"
                             seed += 1
                             if not opt.skip_save:
                                 for x_sample in x_checked_image_torch:
